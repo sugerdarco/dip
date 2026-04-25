@@ -1,0 +1,24 @@
+# ─── Core deep learning ───────────────────────────────────────────────────────
+# PyTorch with CUDA 12.1 (best for 24GB GPU — RTX 3090/4090/A5000 etc.)
+# Install with:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ─── Wavelet transform ────────────────────────────────────────────────────────
+PyWavelets>=1.4.1
+
+# ─── Image I/O ────────────────────────────────────────────────────────────────
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# ─── DICOM support (MRI / CT from scanners) ──────────────────────────────────
+pydicom>=2.4.0
+
+# ─── Scientific computing ─────────────────────────────────────────────────────
+numpy>=1.24.0
+scipy>=1.11.0
+scikit-image>=0.21.0
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+tqdm>=4.66.0
