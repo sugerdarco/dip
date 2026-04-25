@@ -24,7 +24,7 @@ class Paths:
 
 @dataclass
 class ImageConfig:
-    target_size: Tuple[int, int] = (128, 128)         # resize all images to this (lowered from 512 to prevent OOM)
+    target_size: Tuple[int, int] = (512, 512)         # resize all images to this
     grayscale: bool = True                             # medical images → 1 channel
     intensity_range: Tuple[float, float] = (0, 255)   # normalise to this before model
     supported_extensions: Tuple = (
@@ -103,7 +103,7 @@ class TrainingConfig:
     learning_rate: float = 0.0002
     beta1: float = 0.9
     beta2: float = 0.999
-    batch_size: int = 4
+    batch_size: int = 32
     num_epochs: int = 150
     weight_init: str = "xavier_normal"
     dropout_rate: float = 0.3
