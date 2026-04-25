@@ -178,11 +178,4 @@ pyrightconfig.json
 # Data
 data/contents/*
 data/output/*
-# data/checkpoints/*
-
-
-# sample Data - tempory add for referece
-!data/contents/ct/study_0005_0000.png
-!data/contents/mri/study_0001_0000.png
-!data/output/study_0001_0000
-!data/output/pipeline_summary.json
+data/checkpoints/*
