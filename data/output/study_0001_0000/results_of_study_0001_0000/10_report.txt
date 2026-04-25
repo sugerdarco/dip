@@ -1,0 +1,13 @@
+==================================================
+Image        : data/contents/mri/study_0001_0000.png
+Modality     : standard
+Output dir   : /home/r4xok/projects/dip/data/output/study_0001_0000/results_of_study_0001_0000
+──────────────────────────────────────────────────
+MSE          : 20389.845930
+PSNR         : 5.0367 dB
+SSIM         : -0.008355
+NCC          : 0.027570
+Bit rate     : 0.5215 bpp
+Comp. ratio  : 3.84×
+Total time   : 818.0 ms
+==================================================

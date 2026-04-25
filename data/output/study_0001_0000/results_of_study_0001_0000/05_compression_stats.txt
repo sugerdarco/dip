@@ -1,0 +1,7 @@
+=== Entropy Coding Stats ===
+Latent shape      : (1, 256)
+Quantisation bits : 8
+Original size     : 1,024 bytes  (1.0 KB)
+Compressed size   : 267 bytes  (0.3 KB)
+Compression ratio : 3.84×
+Bits per pixel    : 0.5215 bpp

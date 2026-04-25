@@ -1,0 +1,18 @@
+{
+  "z_shape": [
+    1,
+    256
+  ],
+  "q_dtype": "int8",
+  "scale": 0.024841959336224725,
+  "offset": -3.2490618228912354,
+  "bits": 8,
+  "original_bytes": 1024,
+  "compressed_bytes": 267,
+  "compression_ratio": 3.8352,
+  "bpp": 0.5215,
+  "original_shape": [
+    64,
+    64
+  ]
+}
