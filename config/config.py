@@ -15,7 +15,7 @@ class Paths:
     # ── Input ──────────────────────────────────────────────────────────────
     working_dir: str = PROJECT_ROOT                                   # project root
     contents_dir: str = os.path.join(PROJECT_ROOT, "data/contents")        # your MRI/CT folders
-    output_dir: str = os.path.join(PROJECT_ROOT, "data/output")            # all results saved here
+    output_dir: str = os.path.join(PROJECT_ROOT, "data/outputs")           # all results saved here
 
     # ── Checkpoints ────────────────────────────────────────────────────────
     checkpoint_dir: str = os.path.join(PROJECT_ROOT, "data/checkpoints")

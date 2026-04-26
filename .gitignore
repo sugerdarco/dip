@@ -177,5 +177,5 @@ pyrightconfig.json
 
 # Data
 data/contents/*
-data/output/*
+data/outputs/*
 data/checkpoints/*

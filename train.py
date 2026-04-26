@@ -19,7 +19,6 @@ Usage:
         --epochs   150
 """
 
-from numpy.testing import verbose
 import argparse
 import json
 import logging
@@ -177,7 +176,7 @@ def train(contents_dir: str = None,
 
     train_dl = DataLoader(train_ds, batch_size=CFG.training.batch_size,
                           shuffle=True,  num_workers=CFG.num_workers,
-                          pin_memory=CFG.pin_memory, drop_last=True)
+                          pin_memory=CFG.pin_memory, drop_last=False)
     val_dl   = DataLoader(val_ds, batch_size=CFG.training.batch_size,
                           shuffle=False, num_workers=CFG.num_workers,
                           pin_memory=CFG.pin_memory)
@@ -198,7 +197,7 @@ def train(contents_dir: str = None,
         betas=(CFG.training.beta1, CFG.training.beta2),
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=5, factor=0.5, verbose=True
+        optimizer, mode="min", patience=5, factor=0.5
     )
 
     cfg_v  = CFG.vae

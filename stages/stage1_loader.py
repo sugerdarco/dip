@@ -147,14 +147,14 @@ def scan_contents(contents_dir: str = None) -> List[dict]:
 
 def build_output_dir(record: dict, output_root: str = None) -> Path:
     """
-    Returns:   output_root / image_title / results_of_particular_image
-    E.g.:      working_dir/output/brain_mri_001/results_of_brain_mri_001/
+    Returns:   output_root / folder_name_of_origin / image_title / results_of_particular_image
     """
     if output_root is None:
         output_root = CFG.paths.output_dir
 
     image_title = record["stem"]
-    result_dir = Path(output_root) / image_title / f"results_of_{image_title}"
+    rel_dir = record.get("rel_dir", "")
+    result_dir = Path(output_root) / rel_dir / image_title / f"results_of_{image_title}"
     result_dir.mkdir(parents=True, exist_ok=True)
     return result_dir
 
