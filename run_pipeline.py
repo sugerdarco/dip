@@ -35,6 +35,9 @@ import argparse
 import json
 import logging
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +65,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("pipeline")
+
+# Silence noisy intermediate logs from individual stages
+logging.getLogger("stages").setLevel(logging.WARNING)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,7 +137,6 @@ def make_comparison(original: np.ndarray,
     full = np.vstack([panel, diff_panel])
     out_path = result_dir / "10_comparison.png"
     cv2.imwrite(str(out_path), full)
-    log.info(f"  Saved comparison → {out_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,7 +146,9 @@ def make_comparison(original: np.ndarray,
 def run_image(record: dict,
               models: dict,
               device: str,
-              window: str = "3x3") -> dict:
+              window: str = "3x3",
+              fast_io: bool = True,
+              real_output_root: str = None) -> dict:
     """
     Run the full 10-stage pipeline on a single image record.
 
@@ -156,45 +163,68 @@ def run_image(record: dict,
     """
     t_start = time.time()
     image_path = record["path"]
-    log.info(f"\n{'='*60}")
-    log.info(f"Processing: {image_path}")
+    stage_times = {}
 
     # ── Stage 1: Load + preprocess ───────────────────────────────────────────
+    t1 = time.time()
+    
+    ram_dir = None
+    # Optional FAST IO RAM Disk Redirection
+    if fast_io and real_output_root:
+        import uuid
+        from pathlib import Path
+        import shutil
+        original_output_dir = CFG.paths.output_dir
+        # Create a unique isolated RAM-based working directory
+        ram_dir = Path(f"/dev/shm/dip_{uuid.uuid4().hex[:8]}")
+        CFG.paths.output_dir = str(ram_dir)
+    
     arr, result_dir = stage1_loader.run(record)
+    
+    if fast_io and real_output_root:
+        # Revert CFG so other functions continue to work correctly if they rely on it
+        CFG.paths.output_dir = original_output_dir
+
     H, W = arr.shape
-    log.info(f"  Stage 1 ✓  shape={arr.shape}  → {result_dir}")
+    stage_times['S1_load'] = time.time() - t1
 
     # ── Stage 2: DWT decomposition ───────────────────────────────────────────
+    t2 = time.time()
     subbands, stacked = stage2_dwt.run(arr, result_dir)
-    log.info(f"  Stage 2 ✓  DWT subbands stacked: {stacked.shape}")
+    stage_times['S2_dwt'] = time.time() - t2
 
     # ── Stage 3: CAL encoder ─────────────────────────────────────────────────
+    t3 = time.time()
     features, attn_map, enc = stage3_cal_encoder.run(
         stacked, result_dir,
         model=models.get("enc"),
         device=device,
     )
     models["enc"] = enc
-    log.info(f"  Stage 3 ✓  features: {features.shape}")
+    stage_times['S3_cal_encoder'] = time.time() - t3
 
     # ── Stage 4: VAE encoder ─────────────────────────────────────────────────
+    t4 = time.time()
     z, mu, log_var, venc = stage4_vae_encoder.run(
         features, result_dir,
         model=models.get("venc"),
         device=device,
     )
     models["venc"] = venc
-    log.info(f"  Stage 4 ✓  z: {z.shape}")
+    stage_times['S4_vae_encoder'] = time.time() - t4
 
     # ── Stage 5: Entropy coding ──────────────────────────────────────────────
+    t5 = time.time()
     meta = stage5_entropy.run(z, result_dir, original_shape=(H, W))
-    log.info(f"  Stage 5 ✓  {meta['bpp']:.3f} bpp  "
-             f"ratio={meta['compression_ratio']:.2f}×")
+    stage_times['S5_entropy_encode'] = time.time() - t5
 
     # ── Stage 5→6: Entropy decode ────────────────────────────────────────────
+    t5b = time.time()
     z_dec = stage5_entropy.decompress(result_dir, device=device)
+    stage_times['S5_entropy_decode'] = time.time() - t5b
 
     # ── Stage 6+7: VAE decoder ───────────────────────────────────────────────
+    t6 = time.time()
     rec_subbands, vdec = stage6_vae_decoder.run(
         z_dec, result_dir,
         original_shape=(H, W),
@@ -202,9 +232,10 @@ def run_image(record: dict,
         device=device,
     )
     models["vdec"] = vdec
-    log.info(f"  Stage 6 ✓  decoded subbands reconstructed")
+    stage_times['S6_vae_decoder'] = time.time() - t6
 
     # ── Stage 9 (intermediate): Inverse DWT → coarse image ───────────────────
+    t7 = time.time()
     coarse_arr = stage2_dwt.reconstruct(rec_subbands)
     coarse_arr = np.clip(coarse_arr, 0, 255).astype(np.float32)
     # Resize to original size if needed
@@ -212,9 +243,10 @@ def run_image(record: dict,
         coarse_arr = cv2.resize(coarse_arr, (W, H), interpolation=cv2.INTER_LINEAR)
     cv2.imwrite(str(result_dir / "06_coarse_reconstruction.png"),
                 coarse_arr.astype(np.uint8))
-    log.info(f"  Stage 7 ✓  coarse reconstruction: {coarse_arr.shape}")
+    stage_times['S7_inverse_dwt'] = time.time() - t7
 
     # ── Stage 8: DNN pixel estimation ────────────────────────────────────────
+    t8 = time.time()
     refined_img, dnn3x3, dnn1x8 = stage7_dnn_pixel.run(
         coarse_arr, result_dir,
         model_3x3=models.get("dnn3x3"),
@@ -224,22 +256,25 @@ def run_image(record: dict,
     )
     models["dnn3x3"] = dnn3x3
     models["dnn1x8"] = dnn1x8
-    log.info(f"  Stage 8 ✓  DNN pixel refined ({window} window)")
+    stage_times['S8_dnn_pixel'] = time.time() - t8
 
     # ── Stage 9 (final): Trainable spatial filter ────────────────────────────
+    t9 = time.time()
     final_img, sflt = stage8_spatial_filter.run(
         refined_img, result_dir,
         model=models.get("sflt"),
         device=device,
     )
     models["sflt"] = sflt
-    log.info(f"  Stage 9 ✓  Spatial filter applied")
+    stage_times['S9_spatial_filter'] = time.time() - t9
 
     # ── Stage 10: Metrics ────────────────────────────────────────────────────
+    t10 = time.time()
     metrics = compute_all(arr, final_img)
     metrics["bpp"]               = meta["bpp"]
     metrics["compression_ratio"] = meta["compression_ratio"]
     metrics["time_ms"]           = round((time.time() - t_start) * 1000, 1)
+    stage_times['S10_metrics'] = time.time() - t10
 
     # Save metrics JSON
     metrics_path = result_dir / "10_metrics.json"
@@ -247,6 +282,25 @@ def run_image(record: dict,
         json.dump(metrics, f, indent=2)
 
     # Save human-readable report
+    t_report = time.time()
+    
+    # Build stage timing breakdown
+    timing_str = f"{'─'*50}\nStage Timing Breakdown:\n"
+    gpu_time = (stage_times.get('S3_cal_encoder', 0) + 
+                stage_times.get('S4_vae_encoder', 0) + 
+                stage_times.get('S6_vae_decoder', 0) + 
+                stage_times.get('S8_dnn_pixel', 0) + 
+                stage_times.get('S9_spatial_filter', 0))
+    cpu_time = (stage_times.get('S2_dwt', 0) + 
+                stage_times.get('S7_inverse_dwt', 0))
+    
+    for stage, secs in sorted(stage_times.items()):
+        pct = (secs / metrics['time_ms'] * 1000) * 100 if metrics['time_ms'] > 0 else 0
+        timing_str += f"  {stage:20s}: {secs:7.3f}s ({pct:5.1f}%)\n"
+    
+    timing_str += f"  {'GPU_total':20s}: {gpu_time:7.3f}s ({(gpu_time/metrics['time_ms']*1000)*100:5.1f}%)\n"
+    timing_str += f"  {'CPU_total':20s}: {cpu_time:7.3f}s ({(cpu_time/metrics['time_ms']*1000)*100:5.1f}%)\n"
+    
     report = (
         f"{'='*50}\n"
         f"Image        : {image_path}\n"
@@ -260,19 +314,77 @@ def run_image(record: dict,
         f"Bit rate     : {metrics['bpp']:.4f} bpp\n"
         f"Comp. ratio  : {metrics['compression_ratio']:.2f}×\n"
         f"Total time   : {metrics['time_ms']:.1f} ms\n"
+        f"{timing_str}"
         f"{'='*50}\n"
     )
     (result_dir / "10_report.txt").write_text(report)
-    log.info(report)
 
-    # ── Stage 10: Comparison image ───────────────────────────────────────────
+    # ── Stage 11: Comparison image ───────────────────────────────────────────
+    t_comp = time.time()
     make_comparison(arr, coarse_arr, final_img, metrics, result_dir)
+    stage_times['S11_comparison'] = time.time() - t_comp
+
+    # ── Fast I/O Transfer ───────────────────────────────────────────────────
+    if fast_io and real_output_root:
+        # We process in RAM, now move strictly only the final outputs to permanent storage
+        import shutil
+        # deduce the target real directory matching what stage1_loader would have done
+        rel_dir = record.get("rel_dir", "")
+        image_title = record["stem"]
+        perm_dir = Path(real_output_root) / rel_dir / image_title / f"results_of_{image_title}"
+        perm_dir.mkdir(parents=True, exist_ok=True)
+        
+        # We save ONLY the required inference endpoints, dropping 100MB+ of intermediates
+        keep_files = ["10_metrics.json", "10_report.txt", "10_comparison.png", "05_compressed.bin"]
+        for f in keep_files:
+            src = result_dir / f
+            if src.exists():
+                shutil.copy2(str(src), str(perm_dir / f))
+                
+        # Clean up the exact RAM disk root for this image to prevent memory leaks
+        if ram_dir and ram_dir.exists():
+            shutil.rmtree(ram_dir, ignore_errors=True)
+        result_dir = perm_dir
 
     return {
         "image":      image_path,
         "result_dir": str(result_dir),
         "metrics":    metrics,
+        "stage_times": stage_times,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker Process Initializer
+# ─────────────────────────────────────────────────────────────────────────────
+_worker_models = None
+
+def init_worker(device_str):
+    """Initializes PyTorch models once per worker process."""
+    global _worker_models
+    from train import load_checkpoint
+    
+    enc, venc, vdec, sflt = load_checkpoint(device_str)
+    
+    if enc: enc.eval()
+    if venc: venc.eval()
+    if vdec: vdec.eval()
+    if sflt: sflt.eval()
+    
+    _worker_models = {
+        "enc":    enc,
+        "venc":   venc,
+        "vdec":   vdec,
+        "sflt":   sflt,
+        "dnn3x3": None,   # built on first use
+        "dnn1x8": None,
+    }
+
+def run_image_wrapper(args):
+    """Wrapper to unpack arguments and call run_image with global _worker_models."""
+    record, device, window, fast_io, real_output_root = args
+    global _worker_models
+    return run_image(record, _worker_models, device, window, fast_io, real_output_root)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,32 +395,21 @@ def run_all(contents_dir: str = None,
             output_dir: str = None,
             single_image: str = None,
             window: str = "3x3",
-            device_str: str = None):
+            device_str: str = None,
+            batch_size: int = 64,
+            fast_io: bool = True,
+            max_images: int = 0):
     """
     Run the full pipeline on all images in contents_dir,
     or on a single image if --image is specified.
     """
     device = device_str or (CFG.device if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
-    if "cuda" in device and torch.cuda.is_available():
-        log.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # Override config paths if provided
     if contents_dir:
         CFG.paths.contents_dir = contents_dir
     if output_dir:
         CFG.paths.output_dir = output_dir
-
-    # Load trained models (or initialise fresh if no checkpoint)
-    enc, venc, vdec, sflt = load_checkpoint(device)
-    models = {
-        "enc":    enc,
-        "venc":   venc,
-        "vdec":   vdec,
-        "sflt":   sflt,
-        "dnn3x3": None,   # built on first use
-        "dnn1x8": None,
-    }
 
     # Collect image records
     if single_image:
@@ -327,19 +428,49 @@ def run_all(contents_dir: str = None,
         log.error("No images found. Check --contents path.")
         return
 
-    log.info(f"\nProcessing {len(records)} image(s)  |  window={window}\n")
+    if max_images > 0 and len(records) > max_images:
+        log.info(f"Limiting dataset to {max_images} images from {len(records)} total")
+        records = records[:max_images]
+
+    log.info(f"Processing {len(records)} images in parallel...\n")
 
     all_results = []
     failed      = []
 
-    for i, record in enumerate(records, 1):
-        log.info(f"[{i}/{len(records)}] {record['stem']}")
-        try:
-            result = run_image(record, models, device, window=window)
-            all_results.append(result)
-        except Exception as e:
-            log.error(f"  FAILED: {record['path']} — {e}", exc_info=True)
-            failed.append({"image": record["path"], "error": str(e)})
+    # Use ProcessPoolExecutor for true multi-core CPU and GPU processing
+    # The 'batch_size' parameter dynamically translates to the number of parallel workers
+    # processing independent images at the same time. Since inference runs sequentially
+    # per image, scaling this parameter effectively saturates GPU and RAM up to its limit.
+    max_workers = min(batch_size, len(records))
+    ctx = mp.get_context('spawn')
+    
+    if fast_io:
+        log.info("FAST I/O is ENABLED. Intermediate files will be discarded to save Disk I/O bottlenecks.")
+    
+    with ProcessPoolExecutor(max_workers=max_workers, 
+                             mp_context=ctx,
+                             initializer=init_worker, 
+                             initargs=(device,)) as executor:
+        futures = {
+            executor.submit(run_image_wrapper, (record, device, window, fast_io, CFG.paths.output_dir)): (i, record)
+            for i, record in enumerate(records, 1)
+        }
+        
+        completed_count = 0
+        for future in as_completed(futures):
+            idx, record = futures[future]
+            completed_count += 1
+            try:
+                result = future.result()
+                all_results.append(result)
+                
+                # Clean progress tracking instead of per-image spam
+                if completed_count % 100 == 0 or completed_count == len(records):
+                    pct = (completed_count / len(records)) * 100
+                    log.info(f"Progress: {completed_count}/{len(records)} images complete ({pct:.1f}%)")
+            except Exception as e:
+                log.error(f"✗ [{idx}/{len(records)}] {record['stem']} — {e}")
+                failed.append({"image": record["path"], "error": str(e)})
 
     # ── Global summary ────────────────────────────────────────────────────────
     if all_results:
@@ -368,18 +499,33 @@ def run_all(contents_dir: str = None,
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 
-        log.info(f"\n{'='*60}")
-        log.info(f"PIPELINE COMPLETE — {len(all_results)}/{len(records)} images")
-        log.info(f"  Avg PSNR : {avg_psnr:.4f} dB")
-        log.info(f"  Avg SSIM : {avg_ssim:.6f}")
-        log.info(f"  Avg MSE  : {avg_mse:.6f}")
-        log.info(f"  Avg NCC  : {avg_ncc:.6f}")
-        log.info(f"  Avg bpp  : {avg_bpp:.4f}")
-        log.info(f"  Summary  : {summary_path}")
-        log.info(f"{'='*60}\n")
+        # ── Timing Analysis ──────────────────────────────────────────────────
+        if all_results and "stage_times" in all_results[0]:
+            stage_names = all_results[0]["stage_times"].keys()
+            avg_times = {}
+            for stage in stage_names:
+                times = [r["stage_times"][stage] for r in all_results if "stage_times" in r]
+                avg_times[stage] = np.mean(times) if times else 0
+            
+            gpu_stages = ['S3_cal_encoder', 'S4_vae_encoder', 'S6_vae_decoder', 'S8_dnn_pixel', 'S9_spatial_filter']
+            cpu_stages = ['S2_dwt', 'S7_inverse_dwt']
+            
+            total_gpu = sum(avg_times.get(s, 0) for s in gpu_stages)
+            total_cpu = sum(avg_times.get(s, 0) for s in cpu_stages)
+            total = total_gpu + total_cpu + sum(avg_times.values())
+            
+            timing_line = f"Timing: GPU {total_gpu:.2f}s ({total_gpu/total*100:.0f}%) | CPU {total_cpu:.2f}s ({total_cpu/total*100:.0f}%)"
+        else:
+            timing_line = ""
+
+        log.info(f"\n✓ DONE — {len(all_results)}/{len(records)} images")
+        log.info(f"  Metrics: PSNR={avg_psnr:.2f}dB | SSIM={avg_ssim:.4f} | MSE={avg_mse:.4f} | bpp={avg_bpp:.3f}")
+        if timing_line:
+            log.info(f"  {timing_line}")
+        log.info(f"  Summary: {summary_path}\n")
 
         if failed:
-            log.warning(f"  {len(failed)} image(s) failed — see summary JSON.")
+            log.warning(f"✗ {len(failed)} failed")
 
     return all_results
 
@@ -412,6 +558,18 @@ if __name__ == "__main__":
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
         help="cuda or cpu"
     )
+    parser.add_argument(
+        "--batch-size", type=int, default=64,
+        help="Number of images to process in parallel (increases memory and GPU utilization)"
+    )
+    parser.add_argument(
+        "--disable-fast-io", action="store_true",
+        help="Disable RAM disk fast I/O and instead write all intermediate stages to original disk"
+    )
+    parser.add_argument(
+        "--max-images", type=int, default=100000,
+        help="Limit the total number of images processed (runs much faster for validation)"
+    )
     args = parser.parse_args()
 
     run_all(
@@ -420,4 +578,7 @@ if __name__ == "__main__":
         single_image  = args.image,
         window        = args.window,
         device_str    = args.device,
+        batch_size    = args.batch_size,
+        fast_io       = not args.disable_fast_io,
+        max_images    = args.max_images,
     )

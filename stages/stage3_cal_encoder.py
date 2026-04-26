@@ -69,20 +69,23 @@ class CrossAttentionBlock(nn.Module):
                  in_channels: int,
                  embed_dim: int = None,
                  num_heads: int = None,
-                 dropout: float = None):
+                 dropout: float = None,
+                 patch_size: int = None):
         super().__init__()
         self.embed_dim = embed_dim or CFG.cal.embed_dim
         self.num_heads = num_heads or CFG.cal.num_heads
         self.dropout   = dropout   or CFG.cal.dropout
+        self.patch_size = patch_size or CFG.cal.patch_size
         self.head_dim  = self.embed_dim // self.num_heads
         assert self.embed_dim % self.num_heads == 0, \
             "embed_dim must be divisible by num_heads"
 
-        # Project spatial features → Q, K, V sequences
-        self.proj_q = nn.Conv2d(in_channels, self.embed_dim, 1)
-        self.proj_k = nn.Conv2d(in_channels, self.embed_dim, 1)
-        self.proj_v = nn.Conv2d(in_channels, self.embed_dim, 1)
-        self.proj_out = nn.Conv2d(self.embed_dim, in_channels, 1)
+        # Project patch features → Q, K, V sequences
+        self.patch_proj = nn.Linear(in_channels * self.patch_size * self.patch_size, self.embed_dim)
+        self.proj_q = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj_k = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj_v = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj_out = nn.Linear(self.embed_dim, in_channels * self.patch_size * self.patch_size)
 
         self.scale = math.sqrt(self.head_dim)
         self.attn_drop = nn.Dropout(self.dropout)
@@ -101,33 +104,52 @@ class CrossAttentionBlock(nn.Module):
 
         Returns:
             out      : [B, C, H, W]  attention-weighted feature map
-            attn_map : [B, num_heads, HW, HW]  attention weights (for vis)
+            attn_map : [B, num_heads, num_patches, num_patches]  attention weights (for vis)
         """
         B, C, H, W = x_struct.shape
-        N = H * W
+        assert H % self.patch_size == 0 and W % self.patch_size == 0, \
+            f"H={H}, W={W} must be divisible by patch_size={self.patch_size}"
+        num_patches_h = H // self.patch_size
+        num_patches_w = W // self.patch_size
+        num_patches = num_patches_h * num_patches_w
 
-        def project_reshape(proj, x):
-            # [B, embed_dim, H, W] → [B, num_heads, N, head_dim]
-            x = proj(x)                                      # [B, E, H, W]
-            x = x.reshape(B, self.num_heads, self.head_dim, N)
-            return x.permute(0, 1, 3, 2)                    # [B, H, N, D]
+        def extract_patches(x):
+            # x: [B, C, H, W] -> [B, C*ps*ps, num_patches] -> [B, num_patches, C*ps*ps]
+            x = F.unfold(x, kernel_size=self.patch_size, stride=self.patch_size)
+            x = x.transpose(1, 2)
+            # Project to embed_dim
+            x = self.patch_proj(x)  # [B, num_patches, embed_dim]
+            return x
 
-        Q = project_reshape(self.proj_q, x_struct)
-        K = project_reshape(self.proj_k, x_detail)
-        V = project_reshape(self.proj_v, x_detail)
+        # Extract and project patches
+        patches_struct = extract_patches(x_struct)
+        patches_detail = extract_patches(x_detail)
 
-        # Scaled dot-product attention  [Eq. 3]
-        attn = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, H, N, N]
+        # Project to Q, K, V
+        Q = self.proj_q(patches_struct)  # [B, num_patches, embed_dim]
+        K = self.proj_k(patches_detail)
+        V = self.proj_v(patches_detail)
+
+        # Reshape for multi-head
+        Q = Q.view(B, num_patches, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, num_patches, head_dim]
+        K = K.view(B, num_patches, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, num_patches, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        attn = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, num_heads, num_patches, num_patches]
         attn = F.softmax(attn, dim=-1)
         self.last_attn_weights = attn.detach()
 
         attn = self.attn_drop(attn)
-        out = torch.matmul(attn, V)                          # [B, H, N, D]
+        out = torch.matmul(attn, V)  # [B, num_heads, num_patches, head_dim]
 
-        # Reshape back to spatial  [Eq. 4]
-        out = out.permute(0, 1, 3, 2)                        # [B, H, D, N]
-        out = out.reshape(B, self.embed_dim, H, W)
-        out = self.proj_out(out)
+        # Reshape back
+        out = out.transpose(1, 2).contiguous().view(B, num_patches, self.embed_dim)  # [B, num_patches, embed_dim]
+        out = self.proj_out(out)  # [B, num_patches, C*ps*ps]
+        out = out.transpose(1, 2)  # [B, C*ps*ps, num_patches]
+
+        # Fold back to spatial
+        out = F.fold(out, output_size=(H, W), kernel_size=self.patch_size, stride=self.patch_size)  # [B, C, H, W]
         out = self.out_drop(out)
 
         return out, attn
@@ -166,7 +188,7 @@ class DWTEncoder(nn.Module):
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.xavier_normal_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -240,14 +262,16 @@ def run(stacked: np.ndarray,
         features, attn_map = model(t)
 
     # ── Save attention map visualisation ────────────────────────────────────
-    # Average across heads and spatial dims for a 2D heatmap
-    avg_attn = attn_map[0].mean(0)                          # [HW, HW]
+    # Average across heads for a 2D heatmap
+    avg_attn = attn_map[0].mean(0)                          # [num_patches, num_patches]
     h = w = int(avg_attn.shape[0] ** 0.5)
     if h * w == avg_attn.shape[0]:
         heatmap = avg_attn.mean(-1).reshape(h, w).cpu().numpy()
     else:
         heatmap = avg_attn.mean(-1).cpu().numpy().reshape(1, -1)
 
+    # Resize to original spatial resolution for visualization
+    heatmap = cv2.resize(heatmap, (256, 256), interpolation=cv2.INTER_NEAREST)
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
     heatmap_u8 = (heatmap * 255).astype(np.uint8)
     heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)

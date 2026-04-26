@@ -14,7 +14,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 class Paths:
     # ── Input ──────────────────────────────────────────────────────────────
     working_dir: str = PROJECT_ROOT                                   # project root
-    contents_dir: str = os.path.join(PROJECT_ROOT, "data/contents")        # your MRI/CT folders
+    # contents_dir: str = os.path.join(PROJECT_ROOT, "data/contents")        # your MRI/CT folders
+    contents_dir: str = "/home/teaching/data/medical"
+
     output_dir: str = os.path.join(PROJECT_ROOT, "data/outputs")           # all results saved here
 
     # ── Checkpoints ────────────────────────────────────────────────────────
@@ -46,6 +48,7 @@ class CALConfig:
     num_heads: int = 8
     embed_dim: int = 64
     dropout: float = 0.1
+    patch_size: int = 16  # patch size for attention to reduce memory
 
 
 @dataclass
@@ -103,13 +106,14 @@ class TrainingConfig:
     learning_rate: float = 0.0002
     beta1: float = 0.9
     beta2: float = 0.999
-    batch_size: int = 32
+    batch_size: int = 45
     num_epochs: int = 150
     weight_init: str = "xavier_normal"
     dropout_rate: float = 0.3
     early_stopping_patience: int = 10
     validation_split: float = 0.15
     test_split: float = 0.15
+    max_records: int = 100000   # keep only this many images for training/validation/test; 0 means use all
     # cross-validation
     n_folds: int = 5
     n_runs: int = 3                                  # independent runs per fold
@@ -131,7 +135,7 @@ class Config:
 
     device: str = "cuda"          # "cuda" for your 24GB GPU, "cpu" fallback
     seed: int = 42
-    num_workers: int = 4          # DataLoader workers
+    num_workers: int = 8          # Increased from 4 for faster data loading
     pin_memory: bool = True       # faster GPU transfer
 
 

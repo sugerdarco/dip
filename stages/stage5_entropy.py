@@ -161,9 +161,6 @@ def run(z: torch.Tensor,
     )
     stat_path.write_text(stats_text)
 
-    log.info(f"[Stage 5] Compressed {original_bytes//1024} KB → "
-             f"{compressed_bytes//1024} KB  ({bpp:.3f} bpp)")
-
     return meta
 
 
@@ -196,5 +193,4 @@ def decompress(result_dir: Path,
     z_np = dequantise(q, meta["scale"], meta["offset"])
 
     z = torch.from_numpy(z_np).to(device)
-    log.info(f"[Stage 7] Decompressed z shape: {z.shape}, bpp was {meta['bpp']}")
     return z

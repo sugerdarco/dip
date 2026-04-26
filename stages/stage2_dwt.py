@@ -66,8 +66,9 @@ def decompose(arr: np.ndarray,
         "HH": cD.astype(np.float32),
     }
 
-    log.info(f"[Stage 2] DWT done — subband shapes: "
-             f"LL={cA.shape} LH={cH.shape} HL={cV.shape} HH={cD.shape}")
+    # Removed per-image logging to reduce verbosity
+    # log.info(f"[Stage 2] DWT done — subband shapes: "
+    #          f"LL={cA.shape} LH={cH.shape} HL={cV.shape} HH={cD.shape}")
     return subbands
 
 

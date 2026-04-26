@@ -34,6 +34,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import cv2
 
+# Enable cuDNN benchmark for faster convolution
+torch.backends.cudnn.benchmark = True
+
 from config.config import CFG
 from stages.stage1_loader import scan_contents, load_image, preprocess
 from stages.stage2_dwt import decompose, stack_subbands
@@ -45,7 +48,7 @@ from stages.stage8_spatial_filter import TrainableSpatialFilter, combined_loss
 from utils.metrics import compute_all
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Keep INFO level for important training logs
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -134,7 +137,8 @@ def count_params(model: nn.Module) -> int:
 def train(contents_dir: str = None,
           output_dir: str = None,
           epochs: int = None,
-          device_str: str = None):
+          device_str: str = None,
+          max_images: int = None):
 
     # ── Setup ─────────────────────────────────────────────────────────────────
     torch.manual_seed(CFG.seed)
@@ -147,9 +151,13 @@ def train(contents_dir: str = None,
         log.info(f"GPU: {torch.cuda.get_device_name(0)}  "
                  f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 
+    # Mixed precision scaler disabled for now
+    scaler = None
+
     contents_dir = contents_dir or CFG.paths.contents_dir
-    output_dir   = output_dir   or CFG.paths.output_dir
-    epochs       = epochs       or CFG.training.num_epochs
+    output_dir   = output_dir or CFG.paths.output_dir
+    epochs       = epochs or CFG.training.num_epochs
+    max_images   = max_images if max_images is not None else CFG.training.max_records
     ckpt_dir     = Path(CFG.paths.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,6 +166,10 @@ def train(contents_dir: str = None,
     if not all_records:
         log.error("No images found — check contents_dir path.")
         return
+
+    if max_images > 0 and len(all_records) > max_images:
+        log.info(f"Limiting dataset to {max_images} images from {len(all_records)} total")
+        all_records = all_records[:max_images]
 
     random.shuffle(all_records)
     n = len(all_records)
@@ -180,6 +192,9 @@ def train(contents_dir: str = None,
     val_dl   = DataLoader(val_ds, batch_size=CFG.training.batch_size,
                           shuffle=False, num_workers=CFG.num_workers,
                           pin_memory=CFG.pin_memory)
+
+    n_train_batches = len(train_dl)
+    stage2_progress_step = max(1, n_train_batches // 10)
 
     # ── Models + optimiser ────────────────────────────────────────────────────
     enc, venc, vdec, sflt = build_models(device)
@@ -221,8 +236,15 @@ def train(contents_dir: str = None,
             x = x.to(device)   # [B, 4, H/2, W/2]
             y = y.to(device)   # [B, 1, H, W]
 
+            if (batch_idx + 1) % stage2_progress_step == 0 or batch_idx + 1 == n_train_batches:
+                progress = int((batch_idx + 1) * 100 / n_train_batches)
+                log.info(f"[Stage 2] DWT progress: {progress}% "
+                         f"({batch_idx + 1}/{n_train_batches} batches)")
+
             optimizer.zero_grad()
 
+            # Mixed precision training (temporarily disabled)
+            # with torch.amp.autocast(device, enabled=scaler is not None):
             # Forward
             features, _  = enc(x)            # [B, 128, H/2, W/2]
             mu, log_var  = venc(features)     # [B, latent_dim]
@@ -237,10 +259,11 @@ def train(contents_dir: str = None,
 
             # Losses
             l_mse  = F.mse_loss(filtered, y) * lambda_mse
-            l_perc = perceptual_loss(decoded, y)  * lambda_prc
+            # l_perc = perceptual_loss(decoded, y)  * lambda_prc  # Temporarily disabled
             l_kl   = kl_loss(mu, log_var)         * lambda_kl
-            loss   = l_mse + l_perc + l_kl
+            loss   = l_mse + l_kl  # + l_perc
 
+            # Backward
             loss.backward()
             nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
@@ -259,18 +282,19 @@ def train(contents_dir: str = None,
                 x = x.to(device)
                 y = y.to(device)
 
-                features, _  = enc(x)
-                mu, log_var  = venc(features)
-                z = mu                           # deterministic at eval
-                decoded      = vdec(z)
-                decoded_ll   = decoded[:, 0:1, :, :]
-                full_res     = F.interpolate(decoded_ll, size=y.shape[-2:],
-                                             mode="bilinear", align_corners=False)
-                filtered     = sflt(full_res)
+                with torch.amp.autocast(device, enabled=scaler is not None):
+                    features, _  = enc(x)
+                    mu, log_var  = venc(features)
+                    z = mu                           # deterministic at eval
+                    decoded      = vdec(z)
+                    decoded_ll   = decoded[:, 0:1, :, :]
+                    full_res     = F.interpolate(decoded_ll, size=y.shape[-2:],
+                                                 mode="bilinear", align_corners=False)
+                    filtered     = sflt(full_res)
 
-                l_mse  = F.mse_loss(filtered, y) * lambda_mse
-                l_kl   = kl_loss(mu, log_var)    * lambda_kl
-                val_loss_sum += (l_mse + l_kl).item()
+                    l_mse  = F.mse_loss(filtered, y) * lambda_mse
+                    l_kl   = kl_loss(mu, log_var)    * lambda_kl
+                    val_loss_sum += (l_mse + l_kl).item()
 
                 # Compute image metrics on CPU
                 pred_np = (filtered[0, 0].cpu().numpy() * 255.0).astype(np.float32)
@@ -363,9 +387,12 @@ if __name__ == "__main__":
     parser.add_argument("--output",   default=CFG.paths.output_dir)
     parser.add_argument("--epochs",   type=int, default=CFG.training.num_epochs)
     parser.add_argument("--device",   default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--max_images", type=int, default=CFG.training.max_records,
+                        help="Limit the total number of images used for train/val/test; 0 means all")
     args = parser.parse_args()
 
     train(contents_dir=args.contents,
           output_dir=args.output,
           epochs=args.epochs,
-          device_str=args.device)
+          device_str=args.device,
+          max_images=args.max_images)
